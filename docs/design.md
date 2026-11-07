@@ -144,7 +144,7 @@ sequenceDiagram
     D->>DB: UPDATE ... FOR UPDATE SKIP LOCKED (claim)
     DB-->>D: id, task_type, payload, lease_token, deadline
     D->>W: jobsCh ← job
-    W->>W: ctx=WithTimeout; Execute(ctx, payload)
+    W->>W: ctx=WithTimeout и Execute(ctx, payload)
     alt Execute → nil
         W->>DB: Complete(id, lease_token)
     else Execute → err
