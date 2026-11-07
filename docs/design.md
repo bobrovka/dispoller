@@ -116,9 +116,9 @@ payload'а.
                                     background.jobs
 ```
 
-- **Dispatcher** — одна горутина. По тику (или сразу после старта) берёт свободный слот
-  семафора, делает **один** claim-запрос, отправляет задачу в канал. Если задач нет —
-  отпускает слот и ждёт следующего тика.
+- **Dispatcher** — одна горутина. По тику берёт свободный слот семафора (первый claim —
+  через `interval` после старта), делает **один** claim-запрос, отправляет задачу в
+  канал. Если задач нет — отпускает слот и ждёт следующего тика.
 - **Семафор `sem` (канал ёмкости `concurrency`)** — ограничитель параллелизма. Слот
   берётся **до** claim: dispatcher никогда не захватывает задачу, если нет гарантии, что
   её возьмёт свободный воркер (иначе lease будет «гореть», пока задача ждёт в канале).
@@ -127,9 +127,10 @@ payload'а.
 - **store** — тонкий слой над SQL (интерфейс из 5 методов). Реализация `pgStore` на
   `pgxpool.Pool`; в unit-тестах подменяется in-memory фейком (§9).
 
-Один процесс может иметь один `Engine`. Несколько процессов (горизонтальное
-масштабирование) безопасно работают с одной таблицей: `FOR UPDATE SKIP LOCKED` —
-это и есть координация.
+Обычно один процесс держит один `Engine`; несколько `Engine` в одном процессе тоже
+корректны (claim фильтрует по зарегистрированным типам) — так можно разнести типы с
+разными нагрузками (R-8). Несколько процессов (горизонтальное масштабирование)
+безопасно работают с одной таблицей: `FOR UPDATE SKIP LOCKED` — это и есть координация.
 
 Поток данных (happy path):
 
@@ -290,20 +291,23 @@ RETURNING j.id, j.task_type, j.payload, j.attempts, j.max_attempts,
 - **`attempts = j.attempts + 1` при захвате.** Попытка инкрементируется ровно в одной
   точке — в момент захвата; на финализации только сравнение с `max_attempts` (SN-1):
   инкремент и на захвате, и на ошибке считал бы одну попытку дважды. Семантика:
-  **`max_attempts` = число запусков обработчика**, при `max_attempts = 3` задача
-  выполняется максимум 3 раза.
+  **`max_attempts` = число запусков обработчика в штатном цикле** claim→Fail: при
+  `max_attempts = 3` задача выполняется максимум 3 раза. Исключение — авария воркера
+  на последней попытке: ветка B перехвата не сверяется с `attempts`, и задача может
+  быть запущена сверх лимита (SN-16, R-15).
 - **Ветка `OR`** покрывает оба класса кандидатов: свежие `pending` и «застрявшие»
   `processing` с истёкшим lease. `must_be_finished_at IS NULL` для `processing` —
-  defensive-ветка на случай ручных вставок/рестормов (SN-5).
+  defensive-ветка на случай ручных вставок/восстановлений из дампа (SN-5).
 - **`JOIN cfg`** фильтрует кандидатов по зарегистрированным типам и задаёт
   **таймаут на каждый task_type** без второго round-trip. Задачи
   незарегистрированного типа не захватываются вовсе — остаются `pending` и видимы для
   мониторинга, а не выжигают попытки на ошибке «handler not found» (SN-9).
 - **`now()` из БД** и в сравнениях, и в арифметике — единый источник времени.
-- **`ORDER BY id LIMIT 1`** — приблизительный FIFO. Известная особенность связки
-  `ORDER BY + LIMIT + SKIP LOCKED`: если первая по порядку строка заблокирована, она
-  пропускается и может вернуть пустой результат, хотя свободные строки позже по порядку
-  есть. Для очереди это безвредно (следующий тик заберёт), но задокументировано (R-9).
+- **`ORDER BY id LIMIT 1`** — приблизительный FIFO. Под конкуренцией `SKIP LOCKED`
+  пропускает занятые строки и отдаёт следующую свободную (на PG 18 `LockRows` стоит
+  под `Limit` и перебирает строки до первой незаблокированной — проверено на живом
+  инстанте); пустой результат возможен, лишь если в момент запроса заняты все
+  кандидаты. Для очереди это безвредно (следующий тик заберёт), задокументировано (R-9).
 
 Ноль строк в ответе — «очередь пуста».
 
@@ -387,22 +391,22 @@ WHERE id IN (
     SELECT id FROM background.jobs
     WHERE status = 'completed'
       AND updated_at < now() - make_interval(secs => $1::float8)
-    ORDER BY id
     LIMIT $2
 );
 ```
 
-Не подключена к движку; вызывается клиентом по расписанию (обычный cron/задача).
-Пакетность (`LIMIT`) — чтобы не создавать длинные транзакции и не мешать autovacuum.
-`failed` по умолчанию не чистится (диагностика); параметр статусов — на усмотрение
-вызова. Подробности и риски роста таблицы — §10, R-6.
+Не подключена к движку; вызывается клиентом по расписанию (обычный cron/задача) через
+хелпер `Purge` (§6.4), возвращающий число удалённых строк. Пакетность (`LIMIT`) — чтобы
+не создавать длинные транзакции и не мешать autovacuum. Чистятся только `completed`;
+`failed` не трогается (диагностика) — при необходимости удаляется ручным `DELETE` по
+тому же шаблону. Подробности и риски роста таблицы — §10, R-6.
 
 ---
 
 ## 6. Go API: интерфейсы и типы
 
 Пакет `dispoller` в корне модуля `github.com/bobrovka/dispoller`.
-Полный список файлов — §6.5.
+Полный список файлов — §6.6.
 
 ### 6.1. Обработчик
 
@@ -492,7 +496,16 @@ func Enqueue(ctx context.Context, pool *pgxpool.Pool, taskType string, payload [
 // EnqueueTx вставляет задачу в транзакцию клиента (Transactional Outbox).
 // Коммит/rollback — ответственность вызывающего.
 func EnqueueTx(ctx context.Context, tx pgx.Tx, taskType string, payload []byte, opts ...EnqueueOption) (int64, error)
+
+// Purge удаляет completed-задачи старше olderThan, батчами не более limit строк
+// (SQL — §5.6), и возвращает число удалённых строк. Не подключена к движку —
+// вызывайте по расписанию (§10).
+func Purge(ctx context.Context, pool *pgxpool.Pool, olderThan time.Duration, limit int64) (int64, error)
 ```
+
+Аргументы валидируются до похода в БД: пустой или длиннее 255 символов `taskType`,
+`WithMaxAttempts(n)` при `n < 1` возвращаются как ошибки API; ошибки CHECK БД
+(гонка с параллельной записью) оборачиваются с именем ограничения.
 
 ### 6.5. Пример клиентского приложения
 
@@ -517,8 +530,15 @@ type SendEmailPayload struct {
     Body    string `json:"body"`
 }
 
+// emailClient — заглушка внешнего почтового клиента приложения (SMTP/API).
+type emailClient struct{}
+
+func (c *emailClient) Send(ctx context.Context, to, subject, body string) error {
+    return nil // реальная отправка
+}
+
 // SendEmailHandler — пример бизнес-обработчика.
-type SendEmailHandler struct{ cli *email.Client }
+type SendEmailHandler struct{ cli *emailClient }
 
 func (h *SendEmailHandler) Execute(ctx context.Context, payload []byte) error {
     var p SendEmailPayload
@@ -544,7 +564,7 @@ func main() {
         dispoller.WithDefaultExecutionTimeout(time.Minute),
     )
 
-    if err := engine.RegisterHandler("email.send", &SendEmailHandler{cli: email.New()},
+    if err := engine.RegisterHandler("email.send", &SendEmailHandler{cli: &emailClient{}},
         dispoller.WithExecutionTimeout(30*time.Second)); err != nil {
         slog.Error("register", "err", err)
         os.Exit(1)
@@ -558,7 +578,10 @@ func main() {
         }
         defer tx.Rollback(ctx)
 
-        payload, _ := json.Marshal(SendEmailPayload{To: "user@example.com", Subject: "hi"})
+        payload, err := json.Marshal(SendEmailPayload{To: "user@example.com", Subject: "hi"})
+        if err != nil {
+            return err
+        }
         if _, err := dispoller.EnqueueTx(ctx, tx, "email.send", payload); err != nil {
             return err
         }
@@ -584,11 +607,11 @@ func main() {
 .
 ├── dispoller.go        // Engine, Option, Start
 ├── handler.go          // JobHandler, HandlerFunc, HandlerOption, Permanent
-├── enqueue.go          // Enqueue, EnqueueTx, EnqueueOption
+├── enqueue.go          // Enqueue, EnqueueTx, EnqueueOption, Purge
 ├── store.go            // интерфейс store + pgStore (все SQL)
 ├── queries.go          // тексты SQL-запросов (константы)
 ├── engine_test.go      // unit-тесты (fake store)
-├── integration_test.go // +build integration; требует DATABASE_URL
+├── integration_test.go // go:build integration; требует DISPOLLER_TEST_DSN
 ├── schema/
 │   ├── schema.sql      // DDL из §4
 │   └── schema.go       // go:embed для тестов
@@ -625,6 +648,9 @@ stateDiagram-v2
 // Схема псевдокода; реальный код — с полной обработкой ошибок.
 func (e *Engine) dispatchLoop(ctx context.Context) {
     ticker := time.NewTicker(e.interval)
+    defer ticker.Stop()
+    defer close(e.jobsCh) // dispatcher — единственный отправитель (см. 7.4)
+
     for {
         select {
         case <-ctx.Done():
@@ -656,6 +682,7 @@ func (e *Engine) dispatchLoop(ctx context.Context) {
         select {
         case e.jobsCh <- job: // воркер заберёт; слот освободит воркер по завершении
         case <-ctx.Done():
+            <-e.sem               // слот больше не нужен: получателя не будет
             e.releaseQuietly(job) // вернуть в pending, не сжигая попытку
             return
         }
@@ -674,10 +701,26 @@ func (e *Engine) dispatchLoop(ctx context.Context) {
   меньшую задержку при пуле воркеров, но нагружает БД и дублирует логику backpressure.
   Отвергнута; eager-пробуждение dispatcher'а после завершения задачи — в roadmap (§12, SN-14).
 - `pgx.ErrNoRows` («пусто») не логируется как ошибка — это нормальный исход поллинга.
+- При `Start` карта обработчиков замораживается копией для dispatcher'а; контракт —
+  регистрация строго до `Start` (нарушение — гонка на map, R-3).
 
 ### 7.3. Воркер
 
 ```go
+// claimedJob — задача, захваченная claim-запросом (§5.1). lease_token генерирует
+// pgStore (UUID v4 из crypto/rand) в момент захвата; timeout вычисляется там же как
+// must_be_finished_at − now() — часы приложения, только для локального таймаута
+// обработчика (§2 «Часы»), с клампом снизу (не меньше 1s).
+type claimedJob struct {
+    id          int64
+    taskType    string
+    payload     []byte
+    attempts    int
+    maxAttempts int
+    token       [16]byte // lease_token
+    timeout     time.Duration
+}
+
 func (e *Engine) worker(ctx context.Context) {
     for {
         select {
@@ -687,10 +730,16 @@ func (e *Engine) worker(ctx context.Context) {
             if !ok {
                 return // канал закрыт при остановке
             }
-            e.run(ctx, job)
-            <-e.sem // освободить слот
+            e.runWithSlot(ctx, job)
         }
     }
+}
+
+// runWithSlot гарантирует освобождение слота семафора даже при панике внутри
+// библиотеки (паники обработчика перехватываются раньше, в execute, SN-7).
+func (e *Engine) runWithSlot(ctx context.Context, job *claimedJob) {
+    defer func() { <-e.sem }()
+    e.run(ctx, job)
 }
 
 func (e *Engine) run(ctx context.Context, job *claimedJob) {
@@ -701,19 +750,24 @@ func (e *Engine) run(ctx context.Context, job *claimedJob) {
 
     err := e.execute(hctx, job) // см. паники ниже
 
+    // Финализация — с ctx, отвязанным от корневого: при graceful shutdown корневой
+    // ctx уже отменён, а Complete/Release/Fail выполнить всё равно нужно (SN-17).
+    fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+    defer fcancel()
+
     switch {
     case err == nil:
-        e.finalize(ctx, func() error { return e.store.Complete(ctx, job.id, job.token) })
+        e.finalize(fctx, func() error { return e.store.Complete(fctx, job.id, job.token) })
 
     case isShutdown(ctx, err): // движок останавливается, попытку не сжигаем
-        e.finalize(ctx, func() error { return e.store.Release(ctx, job.id, job.token) })
+        e.finalize(fctx, func() error { return e.store.Release(fctx, job.id, job.token) })
 
     default:
         backoff := e.backoffFor(job.attempts) // base * 2^(attempts-1), cap, jitter
         permanent := dispoller.IsPermanent(err)
         msg := truncate(err.Error(), 4096)
-        e.finalize(ctx, func() error {
-            return e.store.Fail(ctx, job.id, job.token, msg, backoff, permanent)
+        e.finalize(fctx, func() error {
+            return e.store.Fail(fctx, job.id, job.token, msg, backoff, permanent)
         })
     }
 }
@@ -730,16 +784,21 @@ func (e *Engine) run(ctx context.Context, job *claimedJob) {
 - **`finalize`** повторяет запрос финализации до 3 раз с паузами (100ms/1s/5s), т.к.
   соединение может мигрировать. Если не удалось — лог error и отказ: задача
   самовосстановится, когда истечёт её lease, и её перехватит другой воркер (двойное
-  выполнение возможно — это заложенный at-least-once, R-1).
-- Важно: финализация выполняется с контекстом **без** таймаута попытки (даже если
-  lease истёк, корректная финализация по токену безопасна).
+  выполнение возможно — это заложенный at-least-once, R-1). Обновление, затронувшее
+  0 строк (fencing потерян, §5.2), ретраям не подлежит — это нормальный исход
+  (лог warning), а не ошибка соединения.
+- Важно: финализация выполняется с контекстом, **отвязанным от корневого**
+  (`context.WithoutCancel`, SN-17), и без таймаута попытки: даже если lease истёк или
+  движок останавливается, корректная финализация по токену безопасна.
 
 ### 7.4. Graceful shutdown
 
 1. Отмена `ctx` (сигнал ОС у клиента) → dispatcher выходит из цикла.
 2. Dispatcher закрывает `jobsCh`.
-3. Воркеры дорабатывают текущую задачу и выходят (задачи, снятые по отмене
-   контекста, возвращаются через Release без сжигания попытки).
+3. Воркеры выходят; in-flight обработчики отменяются вместе с корневым ctx (их
+   контекст — потомок корневого), задачи возвращаются через Release без сжигания
+   попытки. Доработка в пределах grace-периода вместо немедленной отмены — осознанно
+   отложена в v2 (SN-17).
 4. `Start` ждёт все воркеры (`WaitGroup`) и возвращает `nil`.
 
 Если процесс умер жёстко (SIGKILL, OOM) — ничего возвращать некому; задача висит в
@@ -750,12 +809,13 @@ func (e *Engine) run(ctx context.Context, job *claimedJob) {
 ### 7.5. Расчёт backoff
 
 ```
-delay(attempts) = min(base * 2^(attempts-1), max) * jitter(0.8..1.2)
+delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 ```
 
 `attempts` — номер только что проваленной попытки (после claim). Пример при дефолтах
 (base=30s, max=15m, max_attempts=3): попытка 1 → ~30s, попытка 2 → ~60s, попытка 3 →
-`failed`. Jitter размазывает ретраи пачки упавших задач. Значение передаётся в
+`failed`. Jitter размазывает ретраи пачки упавших задач и применяется до cap'а —
+`max` остаётся жёстким потолком задержки. Значение передаётся в
 `Fail($4)` и пишется в `next_attempt_at` — БД единолично решает готовность.
 
 ---
@@ -768,7 +828,7 @@ delay(attempts) = min(base * 2^(attempts-1), max) * jitter(0.8..1.2)
 | `concurrency` | `Start` | — (пример: 2×CPU) | Ограничение на процесс; глобальный предел = сумма по инстансам |
 | `execution_timeout` | `WithExecutionTimeout` | 60s (engine) | lease одной попытки; после истечения задача может быть перехвачена |
 | `backoff base/max` | `WithBackoff` | 30s / 15m | ×2 с джиттером (§7.5) |
-| `max_attempts` | колонка / `WithMaxAttempts` | 3 | Всего запусков обработчика |
+| `max_attempts` | колонка / `WithMaxAttempts` | 3 | Запусков обработчика в штатном цикле (исключение — SN-16) |
 | пул соединений | клиент (`pgxpool`) | pgx-дефолты | `MaxConns ≥ concurrency + 2` (dispatcher + финализации); соединение не удерживается на время Execute |
 
 ---
@@ -786,6 +846,9 @@ delay(attempts) = min(base * 2^(attempts-1), max) * jitter(0.8..1.2)
   → Fail(failed); `Permanent` → Fail(failed, force); паника обработчика → Fail;
   отмена ctx движка → Release;
 - расчёт backoff (границы, cap, jitter-коридор);
+- валидация: `Start` (interval ≤ 0, concurrency < 1, повторный запуск), `Enqueue`
+  (пустой/длинный task_type, maxAttempts < 1);
+- финализация выполняется после отмены ctx движка (`context.WithoutCancel`);
 - shutdown: `Start` возвращает nil, воркеры завершаются, канал закрывается;
 - конкурентность под `-race`: N воркеров × fake store с мьютексом.
 
@@ -805,10 +868,14 @@ delay(attempts) = min(base * 2^(attempts-1), max) * jitter(0.8..1.2)
 | T-6 | дедлайн | вставка `processing`-строки с `must_be_finished_at` в прошлом → перехвачена и выполнена (симуляция упавшего воркера) |
 | T-7 | fencing | длинный обработчик дольше lease: после перехвата его Complete/Fail затрагивает 0 строк, состояние не портится |
 | T-8 | таймаут попытки | обработчик-«спальня» > execution_timeout: ctx отменяется, попытка провалена, ретрай |
-| T-9 | graceful shutdown | in-flight задача дорабатывает; снятая возвращается в pending без сжигания попытки |
+| T-9 | graceful shutdown | снятая при остановке задача возвращается в pending без сжигания попытки; Release выполняется после отмены ctx движка; `Start` возвращает nil |
 | T-10 | `EnqueueTx` | rollback транзакции → задачи нет; commit → есть |
 | T-11 | незарегистрированный тип | задача не захватывается, остаётся pending |
-| T-12 | паника | статус failed/рetry, процесс жив |
+| T-12 | паника | статус failed/retry, процесс жив |
+| T-13 | `Purge` | удаляет только `completed` старше порога и в рамках `limit`; `pending`/`processing`/`failed` не тронуты |
+| T-14 | `WithRunAt` | отложенная задача не захватывается до наступления времени, затем выполняется |
+| T-15 | NULL-дедлайн (SN-5) | `processing`-строка с `must_be_finished_at IS NULL` перехватывается и выполняется |
+| T-16 | перехват сверх лимита (SN-16) | зависшая задача с `attempts = max_attempts` перехватывается и запускается повторно — поведение задокументировано |
 
 ### 9.3. Ограничения среды
 
@@ -832,9 +899,9 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
   (диагностика). Планировать autovacuum: очередь — churn-нагрузка (R-6).
 - **Мониторинг** (запросы для дашборда клиента):
   - глубина очереди: `SELECT count(*) FROM background.jobs WHERE status='pending' AND next_attempt_at <= now();`
-  - застрявшие: `... WHERE status='processing' AND must_be_finished_at < now();`
+  - застрявшие: `... WHERE status='processing' AND (must_be_finished_at < now() OR must_be_finished_at IS NULL);`
   - ошибки за час: `... WHERE status='failed' AND updated_at > now() - interval '1 hour';`
-  - незарегистрированные типы: `SELECT DISTINCT task_type FROM background.jobs WHERE status='pending' AND task_type NOT IN (...);`
+  - незарегистрированные типы (включая «зомби»-`processing` после отката релиза, R-16): `SELECT DISTINCT task_type FROM background.jobs WHERE status IN ('pending','processing') AND task_type NOT IN (...);`
 - **Безопасность.** Роли БД: enqueue-коду достаточно `INSERT`; воркерам —
   `SELECT/UPDATE` на `background.jobs`. `DELETE` нужен только джобу очистки. Payload —
   открытые данные: секреты в payload не класть (R-12).
@@ -876,6 +943,9 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
 7. **Cron-расписания** (`scheduled_at` + периодичность).
 8. **Метрики** (интерфейс-счётчики claim/complete/fail/reclaim).
 9. **Отмена задачи** (`cancelled` статус) и `LISTEN/NOTIFY`-будильник.
+10. **Grace-период при остановке** (`WithShutdownGrace`) — доработка in-flight задач
+    в пределах таймера вместо немедленной отмены (SN-17).
+11. **Жёсткий кэп попыток** — перевод stuck-at-max задач в `failed` при перехвате (SN-16).
 
 ---
 
