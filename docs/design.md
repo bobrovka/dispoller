@@ -183,8 +183,11 @@ CREATE TABLE IF NOT EXISTS background.jobs
     task_type           TEXT        NOT NULL,
     payload             JSONB       NOT NULL DEFAULT '{}'::jsonb,
     status              TEXT        NOT NULL DEFAULT 'pending',
-    -- Дедлайн текущей попытки (lease). NULL допустим только вне 'processing';
-    -- предикат claim'а обрабатывает NULL defensively (см. SN-5).
+    -- Дедлайн текущей попытки (lease). Инвариант протокола: NULL бывает только
+    -- вне 'processing' (claim всегда ставит дедлайн, финализация стирает его).
+    -- Намеренно НЕ CHECK-ограничение: строки внешних писателей (pg_restore,
+    -- ручные вставки, сторонний сервис) не отклоняются, а перехватываются
+    -- defensive-веткой claim'а (см. SN-5).
     must_be_finished_at TIMESTAMPTZ,
     -- Когда задача снова доступна для захвата (ретрай-пауза / отложенный запуск).
     next_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -336,8 +339,13 @@ RETURNING j.id, j.task_type, j.payload, j.attempts, j.max_attempts,
   парой (`lease_token IS NULL`, `status = 'failed'`): движок задачу не исполняет и
   немедленно повторяет claim в том же тике (§7.2) — пачка dead-letter'ов не должна
   голодать очередь по одному на тик. На `attempts` dead-letter не влияет: запуска не
-  было. Штатный цикл (ветка A), Fail и Release счётчик `reclaims` не трогают — бюджет
-  жгут только восстановления после аварий.
+  было; `reclaims` инкрементируется как у обычного перехвата — итоговое значение
+  `max_reclaims + 1`, поэтому признак исчерпания для мониторинга — пара
+  `status = 'failed'` + `error_message`, а не значение счётчика (§10). Сама строка
+  `'reclaim budget exhausted'` — контракт мониторинга: экспортированная константа
+  `ReclaimBudgetExhaustedMessage` (§6.4), её изменение — ломающее изменение для
+  алертов клиентов. Штатный цикл (ветка A), Fail и Release счётчик `reclaims`
+  не трогают — бюджет жгут только восстановления после аварий.
 - **`JOIN cfg`** фильтрует кандидатов по зарегистрированным типам и задаёт
   **таймаут на каждый task_type** без второго round-trip. Задачи
   незарегистрированного типа не захватываются вовсе — остаются `pending` и видимы для
@@ -542,13 +550,17 @@ func WithBackoff(base, max time.Duration) Option         // дефолт: 30s, 1
 // и возвращает управление. Второй вызов — ошибка.
 // interval > 0 — период опроса; concurrency >= 1 — макс. число одновременно
 // выполняемых задач этим процессом.
-// Возвращает ошибку при некорректных аргументах/повторном запуске; после
+// Возвращает ошибку при некорректных аргументах (interval <= 0, concurrency < 1,
+// ни один обработчик не зарегистрирован) или повторном запуске; после
 // graceful остановки возвращает nil.
 func (e *Engine) Start(ctx context.Context, interval time.Duration, concurrency int) error
 ```
 
 Ошибки конфигурации должны всплывать при запуске, а не теряться, поэтому `Start`
-возвращает `error` (SN-6).
+возвращает `error` (SN-6). В том числе запуск без единого зарегистрированного
+обработчика: `unnest` пустого массива типов не матчит ни одной строки, и движок
+молча поллил бы вхолостую, создавая нагрузку без пользы; это конфигурационная
+ошибка, а не штатный режим.
 
 ### 6.4. Постановка задач
 
@@ -576,6 +588,14 @@ func Purge(ctx context.Context, pool *pgxpool.Pool, olderThan time.Duration, lim
 // например когда инфра-шторм выжег бюджеты перехватов (SN-18). Возвращает ошибку,
 // если задача не найдена или не в failed.
 func Requeue(ctx context.Context, pool *pgxpool.Pool, id int64) error
+
+// ReclaimBudgetExhaustedMessage — значение error_message, которое claim проставляет
+// задаче, переведённой в failed по исчерпанию бюджета перехватов (dead-letter,
+// §5.1, SN-18). Строка — контракт мониторинга: алерт dead-letter'а (§10) матчится
+// по status='failed' AND error_message = этой константе, а не по счётчику
+// reclaims (после dead-letter он равен max_reclaims + 1). Изменение значения —
+// ломающее изменение для алертов клиентов.
+const ReclaimBudgetExhaustedMessage = "reclaim budget exhausted"
 ```
 
 Аргументы валидируются до похода в БД: пустой или длиннее 255 символов `taskType`,
@@ -959,8 +979,9 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 - dead-letter-исход claim (`deadLettered`): задача не диспетчеризуется в обработчик,
   слот семафора освобождается, dispatcher немедленно повторяет claim в том же тике;
 - расчёт backoff (границы, cap, jitter-коридор);
-- валидация: `Start` (interval ≤ 0, concurrency < 1, повторный запуск), `Enqueue`
-  (пустой/длинный task_type, maxAttempts < 1);
+- валидация: `Start` (interval ≤ 0, concurrency < 1, ноль зарегистрированных
+  обработчиков, повторный запуск), `Enqueue` (пустой/длинный task_type,
+  maxAttempts < 1);
 - финализация выполняется после отмены ctx движка (`context.WithoutCancel`);
 - shutdown: `Start` возвращает nil, воркеры завершаются, канал закрывается;
 - конкурентность под `-race`: N воркеров × fake store с мьютексом.
@@ -1015,7 +1036,7 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
   - глубина очереди: `SELECT count(*) FROM background.jobs WHERE status='pending' AND next_attempt_at <= now();`
   - застрявшие: `... WHERE status='processing' AND (must_be_finished_at < now() OR must_be_finished_at IS NULL);`
   - ошибки за час: `... WHERE status='failed' AND updated_at > now() - interval '1 hour';`
-  - dead-letter по бюджету перехватов (алерт, SN-18): `SELECT id, task_type, reclaims FROM background.jobs WHERE status='failed' AND error_message='reclaim budget exhausted';` — пачка таких после шторма: разобрать причины и сделать bulk-replay циклом `Requeue` (§5.7);
+  - dead-letter по бюджету перехватов (алерт, SN-18): `SELECT id, task_type, reclaims FROM background.jobs WHERE status='failed' AND error_message='reclaim budget exhausted';` — матч по `status` + `error_message` (константа `ReclaimBudgetExhaustedMessage`, §6.4), а не по счётчику: после dead-letter `reclaims = max_reclaims + 1` (§5.1), равенство счётчика бюджету — ненадёжный признак. Пачка таких после шторма: разобрать причины и сделать bulk-replay циклом `Requeue` (§5.7);
   - незарегистрированные типы (включая «зомби»-`processing` после отката релиза, R-16): `SELECT DISTINCT task_type FROM background.jobs WHERE status IN ('pending','processing') AND task_type NOT IN (...);`
 - **Безопасность.** Роли БД: enqueue-коду достаточно `INSERT`; воркерам —
   `SELECT/UPDATE` на `background.jobs`. `DELETE` нужен только джобу очистки. Payload —
