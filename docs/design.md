@@ -62,9 +62,12 @@
 библиотека обязана уметь вставлять задачу **через `pgx.Tx` клиента**
 (`EnqueueTx`), иначе «transactional» в названии паттерна теряет смысл (SN-2).
 
-**Гарантия — at-least-once.** Задача будет выполнена *как минимум* один раз; в аварийных
-сценариях (воркер завис и его lease истёк, а задача на самом деле ещё дорабатывала) —
-возможно **повторное** выполнение. Поэтому контракт библиотеки для клиентского кода:
+**Гарантия — at-least-once в пределах бюджетов.** Находящаяся в обороте задача будет
+выполнена *как минимум* один раз; в аварийных сценариях (воркер завис и его lease
+истёк, а задача на самом деле ещё дорабатывала) — возможно **повторное** выполнение.
+Обороты задачи ограничены двумя бюджетами: `max_attempts` (штатные запуски) и
+`max_reclaims` (восстановления после аварий); исчерпание любого переводит задачу в
+наблюдаемый `failed` (dead-letter). Поэтому контракт библиотеки для клиентского кода:
 
 > **Обработчик обязан быть идемпотентным.** Библиотека даёт at-least-once;
 > exactly-once на стороне БД без бизнес-ключа идемпотентности не достижим.
@@ -80,6 +83,15 @@
 предъявляет при финализации. `UPDATE ... WHERE lease_token = $2` гарантирует, что
 «опоздавший» старый воркер не перезапишет состояние задачи, уже перехваченной другим
 воркером (защита от lost update; подробное обоснование — SN-4).
+
+**Бюджет перехватов.** Каждое восстановление зависшей задачи — перехват веткой B
+claim-запроса — расходует счётчик `reclaims`. Когда он достигает `max_reclaims`
+(дефолт 10), очередной перехват не запускает обработчик, а переводит задачу в
+`failed` (dead-letter, аналог `maxReceiveCount → DLQ` в SQS). Так серийный перезапуск
+задачи, роняющей процесс при каждом выполнении, ограничен сверху. «Чистая жертва»
+повторных аварий инфраструктуры теоретически может попасть в `failed` без единого
+запуска — это наблюдаемо (`failed` + причина), а не тихая потеря, и обратимо через
+`Requeue` (SN-18).
 
 **Упорядочивание.** Строгого FIFO нет: `ORDER BY id` в claim-запросе даёт лишь
 приблизительный порядок «старые раньше новых», который дополнительно искажается
@@ -178,6 +190,11 @@ CREATE TABLE IF NOT EXISTS background.jobs
     next_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts            INTEGER     NOT NULL DEFAULT 0,
     max_attempts        INTEGER     NOT NULL DEFAULT 3,
+    -- Перехваты веткой B claim'а (восстановления зависших processing-строк).
+    -- Бюджет ограничивает серийный перезапуск после аварий воркера (SN-18);
+    -- штатный цикл claim→Fail и Release счётчик не меняют.
+    reclaims            INTEGER     NOT NULL DEFAULT 0,
+    max_reclaims        INTEGER     NOT NULL DEFAULT 10,
     -- Fencing-токен текущего владельца (NULL = задачи никто не держит).
     lease_token         UUID,
     error_message       TEXT,
@@ -187,13 +204,16 @@ CREATE TABLE IF NOT EXISTS background.jobs
     CONSTRAINT jobs_status_chk       CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT jobs_attempts_chk     CHECK (attempts >= 0),
     CONSTRAINT jobs_max_attempts_chk CHECK (max_attempts >= 1),
+    CONSTRAINT jobs_reclaims_chk     CHECK (reclaims >= 0),
+    CONSTRAINT jobs_max_reclaims_chk CHECK (max_reclaims >= 1),
     CONSTRAINT jobs_task_type_chk    CHECK (length(task_type) BETWEEN 1 AND 255)
 );
 ```
 
-Две колонки схемы отвечают за безопасность ретраев и перехвата: `next_attempt_at`
-(ретрай-пауза; без неё ретраи выжигают попытки за секунды, SN-3) и `lease_token`
-(fencing финализации, SN-4).
+Четыре колонки схемы отвечают за безопасность ретраев и перехвата: `next_attempt_at`
+(ретрай-пауза; без неё ретраи выжигают попытки за секунды, SN-3), `lease_token`
+(fencing финализации, SN-4) и `reclaims`/`max_reclaims` (бюджет перехватов — серийный
+перезапуск после аварий воркера ограничивается dead-letter'ом, SN-18).
 
 ### Индексы
 
@@ -242,9 +262,12 @@ CREATE INDEX jobs_finished_idx
 > **Проверено.** Все запросы этого раздела и DDL §4 прогнаны на живом PostgreSQL 18
 > (контейнер `postgres:18`): захват свежих/отложенных/зависших/NULL-дедлайнных задач,
 > fencing (повторный Complete → 0 строк), переходы pending↔processing→completed/failed,
-> release без сжигания попытки, `EXPLAIN` показал `BitmapOr` по `jobs_pending_idx` +
-> `jobs_stuck_idx`, а двухсессионный тест подтвердил `SKIP LOCKED`: конкурентная
-> сессия забрала следующую задачу за ~90 мс, не блокируясь на занятой строке.
+> release без сжигания попытки, перехват в пределах бюджета (запуск сверх
+> `max_attempts`), dead-letter при исчерпанном бюджете (→ `failed`, `lease_token =
+> NULL`, `attempts` не тронут), `Requeue`, `EXPLAIN` показал `BitmapOr` по
+> `jobs_pending_idx` + `jobs_stuck_idx`, а двухсессионный тест подтвердил
+> `SKIP LOCKED`: конкурентная сессия забрала следующую задачу за ~90 мс, не
+> блокируясь на занятой строке.
 
 ### 5.1. Захват задачи (claim) — ключевая операция
 
@@ -256,7 +279,9 @@ WITH cfg(task_type, timeout_seconds) AS (
     SELECT * FROM unnest($1::text[], $2::float8[])
 ),
 candidate AS (
-    SELECT c.id
+    SELECT c.id,
+           (c.status = 'processing') AS is_reclaim,
+           (c.status = 'processing' AND c.reclaims >= c.max_reclaims) AS dead_letter
     FROM background.jobs AS c
     JOIN cfg ON cfg.task_type = c.task_type
     WHERE (c.status = 'pending' AND c.next_attempt_at <= now())
@@ -267,16 +292,20 @@ candidate AS (
     FOR UPDATE SKIP LOCKED
 )
 UPDATE background.jobs AS j
-SET status              = 'processing',
-    attempts            = j.attempts + 1,
-    lease_token         = $3::uuid,
-    must_be_finished_at = now() + make_interval(secs => cfg.timeout_seconds),
+SET status              = CASE WHEN candidate.dead_letter THEN 'failed' ELSE 'processing' END,
+    attempts            = CASE WHEN candidate.dead_letter THEN j.attempts ELSE j.attempts + 1 END,
+    reclaims            = CASE WHEN candidate.is_reclaim THEN j.reclaims + 1 ELSE j.reclaims END,
+    lease_token         = CASE WHEN candidate.dead_letter THEN NULL ELSE $3::uuid END,
+    must_be_finished_at = CASE WHEN candidate.dead_letter THEN NULL
+                               ELSE now() + make_interval(secs => cfg.timeout_seconds) END,
+    error_message       = CASE WHEN candidate.dead_letter THEN 'reclaim budget exhausted'
+                               ELSE j.error_message END,
     updated_at          = now()
 FROM cfg, candidate
 WHERE j.id = candidate.id
   AND j.task_type = cfg.task_type
 RETURNING j.id, j.task_type, j.payload, j.attempts, j.max_attempts,
-          j.lease_token, j.must_be_finished_at;
+          j.reclaims, j.max_reclaims, j.lease_token, j.must_be_finished_at, j.status;
 ```
 
 Разбор построчно:
@@ -294,10 +323,21 @@ RETURNING j.id, j.task_type, j.payload, j.attempts, j.max_attempts,
   **`max_attempts` = число запусков обработчика в штатном цикле** claim→Fail: при
   `max_attempts = 3` задача выполняется максимум 3 раза. Исключение — авария воркера
   на последней попытке: ветка B перехвата не сверяется с `attempts`, и задача может
-  быть запущена сверх лимита (SN-16, R-15).
+  быть запущена сверх лимита (SN-16). Серия таких перехватов ограничена бюджетом
+  `max_reclaims` (SN-18, R-15): суммарный потолок запусков задачи —
+  `max_attempts + max_reclaims`.
 - **Ветка `OR`** покрывает оба класса кандидатов: свежие `pending` и «застрявшие»
   `processing` с истёкшим lease. `must_be_finished_at IS NULL` для `processing` —
   defensive-ветка на случай ручных вставок/восстановлений из дампа (SN-5).
+- **Флаги `is_reclaim` и `dead_letter`.** Кандидат знает, какой веткой он выбран.
+  Перехват (ветка B) инкрементирует `reclaims`; если бюджет исчерпан, строка **вместо
+  захвата** переводится в `failed` с `error_message = 'reclaim budget exhausted'` и
+  `lease_token = NULL` — это dead-letter (SN-18). Такой исход отличается в `RETURNING`
+  парой (`lease_token IS NULL`, `status = 'failed'`): движок задачу не исполняет и
+  немедленно повторяет claim в том же тике (§7.2) — пачка dead-letter'ов не должна
+  голодать очередь по одному на тик. На `attempts` dead-letter не влияет: запуска не
+  было. Штатный цикл (ветка A), Fail и Release счётчик `reclaims` не трогают — бюджет
+  жгут только восстановления после аварий.
 - **`JOIN cfg`** фильтрует кандидатов по зарегистрированным типам и задаёт
   **таймаут на каждый task_type** без второго round-trip. Задачи
   незарегистрированного типа не захватываются вовсе — остаются `pending` и видимы для
@@ -371,11 +411,14 @@ WHERE id = $1
   AND lease_token = $2;
 ```
 
+Счётчик `reclaims` не меняется: бюджет перехватов жгут только восстановления после
+аварий, а не плановая остановка движка (SN-18).
+
 ### 5.5. Постановка задачи (Enqueue / EnqueueTx)
 
 ```sql
-INSERT INTO background.jobs (task_type, payload, max_attempts, next_attempt_at)
-VALUES ($1, $2::jsonb, $3, COALESCE($4, now()))
+INSERT INTO background.jobs (task_type, payload, max_attempts, max_reclaims, next_attempt_at)
+VALUES ($1, $2::jsonb, $3, $4, COALESCE($5, now()))
 RETURNING id;
 ```
 
@@ -400,6 +443,31 @@ WHERE id IN (
 не создавать длинные транзакции и не мешать autovacuum. Чистятся только `completed`;
 `failed` не трогается (диагностика) — при необходимости удаляется ручным `DELETE` по
 тому же шаблону. Подробности и риски роста таблицы — §10, R-6.
+
+### 5.7. Возврат в очередь после failed (Requeue, helper)
+
+Ручной replay терминальной задачи «с чистого листа» — прежде всего для пачки
+dead-letter'ов, оставшихся после инфра-шторма (SN-18, R-15, R-17):
+
+```sql
+UPDATE background.jobs
+SET status              = 'pending',
+    attempts            = 0,
+    reclaims            = 0,
+    error_message       = NULL,
+    must_be_finished_at = NULL,
+    lease_token         = NULL,
+    next_attempt_at     = now(),
+    updated_at          = now()
+WHERE id = $1
+  AND status = 'failed'
+RETURNING id;
+```
+
+Только из `failed` (0 строк → ошибка API «задача не найдена или не в failed»); оба
+счётчика сбрасываются — replay означает новую жизнь задачи с полными бюджетами
+попыток и перехватов. Не подключена к движку; вызывается оператором или скриптом
+(bulk-replay после шторма — цикл по id, см. §10).
 
 ---
 
@@ -488,6 +556,7 @@ func (e *Engine) Start(ctx context.Context, interval time.Duration, concurrency 
 type EnqueueOption func(*enqueueConfig)
 
 func WithMaxAttempts(n int) EnqueueOption // дефолт: колонка (3)
+func WithMaxReclaims(n int) EnqueueOption // дефолт: колонка (10)
 func WithRunAt(t time.Time) EnqueueOption // отложенный запуск; дефолт: now()
 
 // Enqueue вставляет задачу отдельной транзакцией пула.
@@ -501,11 +570,17 @@ func EnqueueTx(ctx context.Context, tx pgx.Tx, taskType string, payload []byte, 
 // (SQL — §5.6), и возвращает число удалённых строк. Не подключена к движку —
 // вызывайте по расписанию (§10).
 func Purge(ctx context.Context, pool *pgxpool.Pool, olderThan time.Duration, limit int64) (int64, error)
+
+// Requeue возвращает failed-задачу в очередь с чистого листа: pending, attempts=0,
+// reclaims=0 (SQL — §5.7). Назначение — replay после массового dead-letter'а,
+// например когда инфра-шторм выжег бюджеты перехватов (SN-18). Возвращает ошибку,
+// если задача не найдена или не в failed.
+func Requeue(ctx context.Context, pool *pgxpool.Pool, id int64) error
 ```
 
 Аргументы валидируются до похода в БД: пустой или длиннее 255 символов `taskType`,
-`WithMaxAttempts(n)` при `n < 1` возвращаются как ошибки API; ошибки CHECK БД
-(гонка с параллельной записью) оборачиваются с именем ограничения.
+`WithMaxAttempts(n)` / `WithMaxReclaims(n)` при `n < 1` возвращаются как ошибки API;
+ошибки CHECK БД (гонка с параллельной записью) оборачиваются с именем ограничения.
 
 ### 6.5. Пример клиентского приложения
 
@@ -607,7 +682,7 @@ func main() {
 .
 ├── dispoller.go        // Engine, Option, Start
 ├── handler.go          // JobHandler, HandlerFunc, HandlerOption, Permanent
-├── enqueue.go          // Enqueue, EnqueueTx, EnqueueOption, Purge
+├── enqueue.go          // Enqueue, EnqueueTx, EnqueueOption, Purge, Requeue
 ├── store.go            // интерфейс store + pgStore (все SQL)
 ├── queries.go          // тексты SQL-запросов (константы)
 ├── engine_test.go      // unit-тесты (fake store)
@@ -633,14 +708,31 @@ stateDiagram-v2
     processing --> pending: Execute=err и attempts<max (backoff)
     processing --> failed: Execute=err и attempts>=max или Permanent
     processing --> pending: release при shutdown (attempts-1)
+    processing --> failed: перехват при reclaims>=max (dead-letter, SN-18)
     pending --> processing: повторный claim
+    failed --> pending: Requeue (ручной replay, SN-18)
     completed --> [*]
     failed --> [*]
 ```
 
 Переход `processing → pending` по истечении lease не меняет статус в БД: строка так и
 остаётся `processing` с просроченным `must_be_finished_at`, а «переход» происходит
-логически — её забирает ветка B claim-запроса.
+логически — её забирает ветка B claim-запроса. Если к этому моменту бюджет перехватов
+исчерпан, вместо запуска она уходит в `failed` (dead-letter, SN-18).
+
+Матрица «ситуация → реакция» — как система различает и разрешает проблемные ситуации
+(исходы — SQL-операции §5):
+
+| Ситуация | Как распознаётся | Реакция системы | Счётчики |
+|---|---|---|---|
+| Задача завершилась неуспешно, попытки остались | Fail по валидному токену, `attempts < max_attempts` | → `pending`, пауза backoff в `next_attempt_at` (§5.3) | `attempts` посчитан на claim |
+| Задача завершилась неуспешно, попытки исчерпаны | Fail, `attempts >= max_attempts` | → `failed` (§5.3) | — |
+| Перманентная ошибка (невалидный payload и т.п.) | Fail с force (SN-8) | → `failed` сразу, без ретраев | — |
+| Обработчик пропал без вести (процесс умер/завис), бюджет перехватов не исчерпан | claim ветка B: `processing` + истёкший lease, `reclaims < max_reclaims` (§5.1) | перехват: задача запускается заново другим воркером | `attempts+1`, `reclaims+1`, новый `lease_token` |
+| Обработчик пропал без вести, бюджет перехватов исчерпан | claim ветка B, `reclaims >= max_reclaims` | dead-letter: → `failed` **без запуска** обработчика, `error_message = 'reclaim budget exhausted'` (SN-18) | `reclaims+1`, `attempts` не меняется |
+| Опоздавший воркер финализирует уже перехваченную задачу | Complete/Fail/Release по чужому `lease_token` → 0 строк | результат молча отбрасывается, лог warning (fencing, §5.2, SN-4) | — |
+| Остановка движка с задачей на руках | отмена корневого ctx → Release (§5.4) | → `pending` без сжигания попытки | `attempts−1`, `reclaims` не меняются |
+| Ручной replay после `failed` | `Requeue(id)` (§5.7) | → `pending` с чистого листа | `attempts=0`, `reclaims=0` |
 
 ### 7.2. Dispatcher
 
@@ -658,33 +750,46 @@ func (e *Engine) dispatchLoop(ctx context.Context) {
         case <-ticker.C:
         }
 
-        // Слот берём ДО claim: не захватываем задачу, пока нет воркера,
-        // который гарантированно её возьмёт (иначе lease прогорает впустую).
-        select {
-        case e.sem <- struct{}{}:
-        case <-ctx.Done():
-            return
-        }
-
-        job, err := e.store.Claim(ctx, e.types(), e.timeouts())
-        if err != nil {
-            <-e.sem
-            if !errors.Is(err, pgx.ErrNoRows) {
-                e.log.Error("claim", "err", err) // БД недоступна — ждём следующий тик
+        // Внутренний цикл: один тик может дать несколько claim-запросов, т.к.
+        // dead-letter-исход (бюджет перехватов исчерпан, §5.1) не приносит
+        // задачу — повторяем немедленно, чтобы пачка stuck-строк после шторма
+        // не голодала свежие pending по одному dead-letter'у на тик.
+        for {
+            // Слот берём ДО claim: не захватываем задачу, пока нет воркера,
+            // который гарантированно её возьмёт (иначе lease прогорает впустую).
+            select {
+            case e.sem <- struct{}{}:
+            case <-ctx.Done():
+                return
             }
-            continue
-        }
-        if job == nil { // очередь пуста
-            <-e.sem
-            continue
-        }
 
-        select {
-        case e.jobsCh <- job: // воркер заберёт; слот освободит воркер по завершении
-        case <-ctx.Done():
-            <-e.sem               // слот больше не нужен: получателя не будет
-            e.releaseQuietly(job) // вернуть в pending, не сжигая попытку
-            return
+            job, err := e.store.Claim(ctx, e.types(), e.timeouts())
+            if err != nil {
+                <-e.sem
+                if !errors.Is(err, pgx.ErrNoRows) {
+                    e.log.Error("claim", "err", err) // БД недоступна — ждём следующий тик
+                }
+                break // ждём следующий тик
+            }
+            if job == nil { // очередь пуста
+                <-e.sem
+                break
+            }
+            if job.deadLettered { // перехват сверх бюджета → failed в claim (§5.1)
+                <-e.sem
+                e.log.Warn("job dead-lettered: reclaim budget exhausted",
+                    "id", job.id, "task_type", job.taskType, "reclaims", job.reclaims)
+                continue // немедленный повторный claim в этом же тике
+            }
+
+            select {
+            case e.jobsCh <- job: // воркер заберёт; слот освободит воркер по завершении
+            case <-ctx.Done():
+                <-e.sem               // слот больше не нужен: получателя не будет
+                e.releaseQuietly(job) // вернуть в pending, не сжигая попытку
+                return
+            }
+            break // задача ушла воркеру — ждём следующий тик
         }
     }
 }
@@ -692,9 +797,10 @@ func (e *Engine) dispatchLoop(ctx context.Context) {
 
 Ключевые решения:
 
-- **Один claim-запрос на тик на процесс** — нагрузка поллинга не зависит от числа
-  воркеров и равна `1/interval` запросов/сек на инстанс (дёшево: два маленьких частичных
-  индекса).
+- **Один claim-запрос на тик на процесс** (плюс по одному на каждый dead-letter-исход,
+  разбираемый немедленным повтором в том же тике, — редкие и короткие) — нагрузка
+  поллинга не зависит от числа воркеров и равна `1/interval` запросов/сек на инстанс
+  (дёшево: два маленьких частичных индекса).
 - **Сначала слот — потом захват.** Альтернатива (захват, потом блокирующая отправка в
   канал) горит lease'ом, пока задача ждёт воркера. Отвергнута.
 - **Альтернатива «каждый воркер поллит сам»** (N конкурирующих запросов на тик) даёт
@@ -717,8 +823,12 @@ type claimedJob struct {
     payload     []byte
     attempts    int
     maxAttempts int
+    reclaims    int
     token       [16]byte // lease_token
     timeout     time.Duration
+    // true → задача ушла в failed по бюджету перехватов прямо в claim (§5.1):
+    // token нулевой, обработчик не запускать, слот освободить и повторить claim.
+    deadLettered bool
 }
 
 func (e *Engine) worker(ctx context.Context) {
@@ -829,6 +939,7 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 | `execution_timeout` | `WithExecutionTimeout` | 60s (engine) | lease одной попытки; после истечения задача может быть перехвачена |
 | `backoff base/max` | `WithBackoff` | 30s / 15m | ×2 с джиттером (§7.5) |
 | `max_attempts` | колонка / `WithMaxAttempts` | 3 | Запусков обработчика в штатном цикле (исключение — SN-16) |
+| `max_reclaims` | колонка / `WithMaxReclaims` | 10 | Бюджет перехватов ветки B (SN-18); щедрее реальной частоты жёстких остановок процесса (деплой без drain, eviction). Graceful shutdown бюджет не жжёт |
 | пул соединений | клиент (`pgxpool`) | pgx-дефолты | `MaxConns ≥ concurrency + 2` (dispatcher + финализации); соединение не удерживается на время Execute |
 
 ---
@@ -845,6 +956,8 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 - исходы `run`: nil → Complete; ошибка с попытками → Fail(pending); ошибка без попыток
   → Fail(failed); `Permanent` → Fail(failed, force); паника обработчика → Fail;
   отмена ctx движка → Release;
+- dead-letter-исход claim (`deadLettered`): задача не диспетчеризуется в обработчик,
+  слот семафора освобождается, dispatcher немедленно повторяет claim в том же тике;
 - расчёт backoff (границы, cap, jitter-коридор);
 - валидация: `Start` (interval ≤ 0, concurrency < 1, повторный запуск), `Enqueue`
   (пустой/длинный task_type, maxAttempts < 1);
@@ -868,14 +981,15 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 | T-6 | дедлайн | вставка `processing`-строки с `must_be_finished_at` в прошлом → перехвачена и выполнена (симуляция упавшего воркера) |
 | T-7 | fencing | длинный обработчик дольше lease: после перехвата его Complete/Fail затрагивает 0 строк, состояние не портится |
 | T-8 | таймаут попытки | обработчик-«спальня» > execution_timeout: ctx отменяется, попытка провалена, ретрай |
-| T-9 | graceful shutdown | снятая при остановке задача возвращается в pending без сжигания попытки; Release выполняется после отмены ctx движка; `Start` возвращает nil |
+| T-9 | graceful shutdown | снятая при остановке задача возвращается в pending без сжигания попытки; Release выполняется после отмены ctx движка; `reclaims` не меняется; `Start` возвращает nil |
 | T-10 | `EnqueueTx` | rollback транзакции → задачи нет; commit → есть |
 | T-11 | незарегистрированный тип | задача не захватывается, остаётся pending |
 | T-12 | паника | статус failed/retry, процесс жив |
 | T-13 | `Purge` | удаляет только `completed` старше порога и в рамках `limit`; `pending`/`processing`/`failed` не тронуты |
 | T-14 | `WithRunAt` | отложенная задача не захватывается до наступления времени, затем выполняется |
 | T-15 | NULL-дедлайн (SN-5) | `processing`-строка с `must_be_finished_at IS NULL` перехватывается и выполняется |
-| T-16 | перехват сверх лимита (SN-16) | зависшая задача с `attempts = max_attempts` перехватывается и запускается повторно — поведение задокументировано |
+| T-16 | перехват сверх лимита (SN-16) | зависшая задача с `attempts = max_attempts` и неполным бюджетом перехватывается и запускается повторно — единичный запуск сверх `max_attempts` задокументирован; `reclaims` растёт |
+| T-17 | бюджет перехватов (SN-18) | задача с `reclaims = max_reclaims` при перехвате уходит в `failed` без запуска обработчика (`error_message = 'reclaim budget exhausted'`, `lease_token = NULL`, `attempts` не тронут); `Requeue` возвращает её в pending с нулевыми счётчиками и задача выполняется; `Requeue` не-failed строки — 0 строк |
 
 ### 9.3. Ограничения среды
 
@@ -901,6 +1015,7 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
   - глубина очереди: `SELECT count(*) FROM background.jobs WHERE status='pending' AND next_attempt_at <= now();`
   - застрявшие: `... WHERE status='processing' AND (must_be_finished_at < now() OR must_be_finished_at IS NULL);`
   - ошибки за час: `... WHERE status='failed' AND updated_at > now() - interval '1 hour';`
+  - dead-letter по бюджету перехватов (алерт, SN-18): `SELECT id, task_type, reclaims FROM background.jobs WHERE status='failed' AND error_message='reclaim budget exhausted';` — пачка таких после шторма: разобрать причины и сделать bulk-replay циклом `Requeue` (§5.7);
   - незарегистрированные типы (включая «зомби»-`processing` после отката релиза, R-16): `SELECT DISTINCT task_type FROM background.jobs WHERE status IN ('pending','processing') AND task_type NOT IN (...);`
 - **Безопасность.** Роли БД: enqueue-коду достаточно `INSERT`; воркерам —
   `SELECT/UPDATE` на `background.jobs`. `DELETE` нужен только джобу очистки. Payload —
@@ -926,6 +1041,7 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
 | 6 | БД-часы как истина | Часы приложения | NTP-перекос между инстансами не влияет на корректность |
 | 7 | Восстановление упавшего воркера ≈ за execution_timeout | Мгновенное (heartbeat) | Внешний координатор не нужен; heartbeat-продление lease — v2 |
 | 8 | Последняя ошибка только в `error_message` | Полный лог попыток | Минимализм; аудит-таблица попыток — v2 |
+| 9 | Dead-letter: бюджет перехватов `max_reclaims` (SN-18) | Неограниченное восстановление после аварий | Crash-loop «ядовитой» задачи обрывается; жертва-дефект принят как в SQS `maxReceiveCount` и закрывается щедрым дефолтом, алертом и `Requeue` |
 
 ---
 
@@ -945,7 +1061,6 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
 9. **Отмена задачи** (`cancelled` статус) и `LISTEN/NOTIFY`-будильник.
 10. **Grace-период при остановке** (`WithShutdownGrace`) — доработка in-flight задач
     в пределах таймера вместо немедленной отмены (SN-17).
-11. **Жёсткий кэп попыток** — перевод stuck-at-max задач в `failed` при перехвате (SN-16).
 
 ---
 
