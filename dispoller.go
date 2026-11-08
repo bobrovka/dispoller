@@ -19,6 +19,7 @@ import (
 	"math"
 	"math/rand"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,9 +413,13 @@ func (e *Engine) backoffFor(attempts int) time.Duration {
 	return delay
 }
 
-// truncate обрезает s до n байт, не разрывая UTF-8-последовательность:
-// PostgreSQL отклоняет невалидный UTF-8 в text.
+// truncate приводит s к валидному UTF-8 (сырые байты из чужих ошибок PostgreSQL
+// отклоняет — SQLSTATE 22021) и обрезает до n байт, не разрывая
+// UTF-8-последовательность.
 func truncate(s string, n int) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "�")
+	}
 	if len(s) <= n {
 		return s
 	}

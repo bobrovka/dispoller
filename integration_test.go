@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,15 +210,16 @@ func (c *execCounter) total() int {
 // idPayload кодирует идентификатор задачи в payload (для счётчика запусков).
 func idPayload(id int64) []byte { return []byte(fmt.Sprintf(`{"id":%d}`, id)) }
 
-func payloadID(t *testing.T, payload []byte) int64 {
-	t.Helper()
+// payloadID — декодирует id из payload. Возвращает ошибку (а не t.Fatalf):
+// хелпер зовётся из горутины воркера, где Fatal недопустим.
+func payloadID(payload []byte) (int64, error) {
 	var p struct {
 		ID int64 `json:"id"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
-		t.Fatalf("unmarshal payload %s: %v", payload, err)
+		return 0, fmt.Errorf("test: unmarshal payload %s: %w", payload, err)
 	}
-	return p.ID
+	return p.ID, nil
 }
 
 // startEngines поднимает движки и возвращает функцию graceful-остановки,
@@ -253,14 +255,16 @@ func startEngines(t *testing.T, interval time.Duration, concurrency int, count i
 }
 
 // insertStuck вставляет processing-строку «умершего» воркера (T-6, T-15..T-17):
-// lease уже истёк (или NULL), поля счётчиков — по аргументам.
-func insertStuck(t *testing.T, taskType string, attempts, reclaims int, deadline string) int64 {
+// lease уже истёк (или NULL), поля счётчиков и payload — по аргументам.
+// Payload кладётся в тот же INSERT: движки уже запущены, отдельный UPDATE
+// создавал бы окно, где claim забирает строку с дефолтным '{}'.
+func insertStuck(t *testing.T, taskType string, attempts, reclaims int, deadline string, payload []byte) int64 {
 	t.Helper()
 	var id int64
 	err := testPool.QueryRow(context.Background(),
-		`INSERT INTO background.jobs (task_type, status, attempts, reclaims, must_be_finished_at)
-		 VALUES ($1, 'processing', $2, $3, `+deadline+`) RETURNING id`,
-		taskType, attempts, reclaims).Scan(&id)
+		`INSERT INTO background.jobs (task_type, status, payload, attempts, reclaims, must_be_finished_at)
+		 VALUES ($1, 'processing', $4::jsonb, $2, $3, `+deadline+`) RETURNING id`,
+		taskType, attempts, reclaims, payload).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert stuck row: %v", err)
 	}
@@ -300,7 +304,10 @@ func TestT2_RetriesWithBackoff(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t2", HandlerFunc(func(_ context.Context, p []byte) error {
-			id := payloadID(t, p)
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
 			if counter.incr(id) < 3 {
 				return errors.New("temporary")
 			}
@@ -354,7 +361,11 @@ func TestT4_PermanentError(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t4", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return Permanent(errors.New("bad payload"))
 		})); err != nil {
 			t.Fatal(err)
@@ -379,7 +390,11 @@ func TestT5_ConcurrentClaim(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 10*time.Millisecond, 4, 2, func(e *Engine) {
 		if err := e.RegisterHandler("t5", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return nil
 		})); err != nil {
 			t.Fatal(err)
@@ -416,7 +431,11 @@ func TestT6_ReclaimStuckJob(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t6", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return nil
 		})); err != nil {
 			t.Fatal(err)
@@ -424,8 +443,7 @@ func TestT6_ReclaimStuckJob(t *testing.T) {
 	})
 	defer stop()
 
-	id := insertStuck(t, "t6", 1, 0, "now() - interval '1 minute'")
-	execSQL(t, `UPDATE background.jobs SET payload = $1 WHERE id = $2`, idPayload(6), id)
+	id := insertStuck(t, "t6", 1, 0, "now() - interval '1 minute'", idPayload(6))
 
 	waitInteg(t, 10*time.Second, "stuck job completed", func() bool {
 		return fetchJob(t, id).status == statusCompleted
@@ -442,16 +460,30 @@ func TestT6_ReclaimStuckJob(t *testing.T) {
 	}
 }
 
-// T-7: fencing — обработчик дольше lease: после перехвата его Complete затрагивает
-// 0 строк, состояние не портится (SN-4).
+// T-7: fencing — обработчик дольше lease: после перехвата его финализация по
+// чужому lease_token затрагивает 0 строк, состояние не портится (SN-4).
+//
+// Первая попытка переживает lease и завершается ОШИБКОЙ: без fencing-предиката
+// в Fail опоздавший воркер перевернул бы completed → pending, и тест увидел бы
+// лишние attempts/executions. Успешный late-Complete такой детекции не даёт
+// (он писал бы те же значения). Детерминированный прямой тест предиката —
+// TestFencingDirectSQL.
 func TestT7_FencingLostUpdate(t *testing.T) {
 	counter := newExecCounter()
+	var firstStart atomic.Int64 // unix nano старта первой попытки
 	stop := startEngines(t, 20*time.Millisecond, 4, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t7", HandlerFunc(func(ctx context.Context, p []byte) error {
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
 			// Первая попытка «дорабатывает» дольше lease в 150ms, игнорируя ctx,
-			// — как медленный SMTP; перехват (вторая) завершает мгновенно.
-			if counter.incr(payloadID(t, p)) == 1 {
+			// — как медленный SMTP, — и всё равно падает; перехват (вторая)
+			// завершает мгновенно и успешно.
+			if counter.incr(id) == 1 {
+				firstStart.Store(time.Now().UnixNano())
 				time.Sleep(500 * time.Millisecond)
+				return errors.New("late failure")
 			}
 			return nil
 		}), WithExecutionTimeout(150*time.Millisecond)); err != nil {
@@ -464,7 +496,16 @@ func TestT7_FencingLostUpdate(t *testing.T) {
 	waitInteg(t, 15*time.Second, "completed by second claim", func() bool {
 		return fetchJob(t, id).status == statusCompleted
 	})
+	// Ждём момента, к которому поздний Fail первого воркера (старт + 500ms)
+	// гарантированно приземлился — включая гипотетический повторный claim,
+	// который устроил бы сломанный fencing (backoff ≤ 120ms + тик 20ms).
+	if rest := time.Until(time.Unix(0, firstStart.Load()).Add(900 * time.Millisecond)); rest > 0 {
+		time.Sleep(rest)
+	}
 	row := fetchJob(t, id)
+	if row.status != statusCompleted {
+		t.Errorf("status = %q, want completed (late Fail must not flip it)", row.status)
+	}
 	if row.attempts != 2 {
 		t.Errorf("attempts = %d, want 2 (первый claim + перехват)", row.attempts)
 	}
@@ -476,13 +517,117 @@ func TestT7_FencingLostUpdate(t *testing.T) {
 	}
 }
 
+// TestFencingDirectSQL — детерминированная проверка fencing-предиката
+// completeSQL/failSQL/releaseSQL (design.md §5.2–§5.4, SN-4): финализация по
+// чужому lease_token затрагивает 0 строк (errFencingLost) и не меняет состояние.
+func TestFencingDirectSQL(t *testing.T) {
+	ctx := context.Background()
+	st := &pgStore{pool: testPool}
+	wrong, err := newLeaseToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := func(taskType string, id int64) *claimedJob {
+		t.Helper()
+		// Захватываем конкретную строку: тип одноразовый, других кандидатов нет.
+		job, err := st.Claim(ctx, []string{taskType}, []float64{60})
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if job == nil || job.id != id {
+			t.Fatalf("claim returned %+v, want job %d", job, id)
+		}
+		return job
+	}
+
+	for _, tc := range []struct {
+		name       string
+		right      func(job *claimedJob) error
+		wrong      func(id int64, token [16]byte) error
+		afterWrong func(t *testing.T, id int64)
+		afterRight func(t *testing.T, id int64)
+	}{
+		{
+			name:  "complete",
+			right: func(job *claimedJob) error { return st.Complete(ctx, job.id, job.token) },
+			wrong: func(id int64, token [16]byte) error { return st.Complete(ctx, id, token) },
+			afterWrong: func(t *testing.T, id int64) {
+				if row := fetchJob(t, id); row.status != statusProcessing || row.leaseNull {
+					t.Fatalf("wrong-token Complete changed state: %+v", row)
+				}
+			},
+			afterRight: func(t *testing.T, id int64) {
+				if row := fetchJob(t, id); row.status != statusCompleted || !row.leaseNull {
+					t.Fatalf("right-token Complete did not finalize: %+v", row)
+				}
+			},
+		},
+		{
+			name:  "fail",
+			right: func(job *claimedJob) error { return st.Fail(ctx, job.id, job.token, "boom", 1, false) },
+			wrong: func(id int64, token [16]byte) error { return st.Fail(ctx, id, token, "boom", 1, false) },
+			afterWrong: func(t *testing.T, id int64) {
+				if row := fetchJob(t, id); row.status != statusProcessing || row.errMsg != nil {
+					t.Fatalf("wrong-token Fail changed state: %+v", row)
+				}
+			},
+			afterRight: func(t *testing.T, id int64) {
+				row := fetchJob(t, id)
+				if row.status != statusPending || row.errMsg == nil || *row.errMsg != "boom" {
+					t.Fatalf("right-token Fail did not apply: %+v", row)
+				}
+			},
+		},
+		{
+			name:  "release",
+			right: func(job *claimedJob) error { return st.Release(ctx, job.id, job.token) },
+			wrong: func(id int64, token [16]byte) error { return st.Release(ctx, id, token) },
+			afterWrong: func(t *testing.T, id int64) {
+				if row := fetchJob(t, id); row.status != statusProcessing {
+					t.Fatalf("wrong-token Release changed state: %+v", row)
+				}
+			},
+			afterRight: func(t *testing.T, id int64) {
+				if row := fetchJob(t, id); row.status != statusPending || row.attempts != 0 {
+					t.Fatalf("right-token Release did not apply: %+v", row)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskType := uniqType(t, time.Now().UnixNano())
+			id := mustEnqueue(t, taskType, []byte(`{}`))
+			job := claim(taskType, id)
+
+			if err := tc.wrong(id, wrong); !errors.Is(err, errFencingLost) {
+				t.Fatalf("wrong token: got %v, want errFencingLost", err)
+			}
+			tc.afterWrong(t, id)
+
+			if err := tc.right(job); err != nil {
+				t.Fatalf("right token: %v", err)
+			}
+			tc.afterRight(t, id)
+		})
+	}
+}
+
+// uniqType — одноразовый task_type для изолированного claim конкретной строки.
+func uniqType(t *testing.T, seed int64) string {
+	t.Helper()
+	return fmt.Sprintf("fence.%d.%d", seed, time.Now().UnixNano())
+}
+
 // T-8: таймаут попытки — обработчик-«спальня» дольше execution_timeout: ctx
 // отменяется, попытка провалена, ретрай.
 func TestT8_AttemptTimeout(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t8", HandlerFunc(func(ctx context.Context, p []byte) error {
-			id := payloadID(t, p)
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
 			if counter.incr(id) == 1 {
 				<-ctx.Done() // первая попытка «зависает» до таймаута
 				return ctx.Err()
@@ -640,7 +785,11 @@ func TestT12_HandlerPanic(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t12", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			panic("boom")
 		})); err != nil {
 			t.Fatal(err)
@@ -665,6 +814,11 @@ func TestT12_HandlerPanic(t *testing.T) {
 // T-13: Purge — удаляет только completed старше порога и в рамках limit;
 // pending/processing/failed не тронуты.
 func TestT13_Purge(t *testing.T) {
+	// БД переиспользуется между прогонами: чистим чужие старые completed, чтобы
+	// точные счётчики ниже не зависели от возраста строк прошлых прогонов.
+	execSQL(t, `DELETE FROM background.jobs
+	            WHERE status = 'completed' AND updated_at < now() - interval '1 hour'`)
+
 	// 3 старых completed, 1 старый failed, 1 старый pending (незарегистрированный
 	// тип — никто не тронет), 1 свежий completed.
 	var oldCompleted []int64
@@ -733,7 +887,11 @@ func TestT14_RunAt(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t14", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return nil
 		})); err != nil {
 			t.Fatal(err)
@@ -769,8 +927,7 @@ func TestT15_NullDeadlineReclaim(t *testing.T) {
 	})
 	defer stop()
 
-	id := insertStuck(t, "t15", 1, 0, "NULL")
-	execSQL(t, `UPDATE background.jobs SET payload = $1 WHERE id = $2`, []byte(`{}`), id)
+	id := insertStuck(t, "t15", 1, 0, "NULL", []byte(`{}`))
 
 	waitInteg(t, 10*time.Second, "null-deadline row completed", func() bool {
 		return fetchJob(t, id).status == statusCompleted
@@ -786,7 +943,11 @@ func TestT16_ReclaimBeyondMaxAttempts(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t16", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return nil
 		})); err != nil {
 			t.Fatal(err)
@@ -795,8 +956,7 @@ func TestT16_ReclaimBeyondMaxAttempts(t *testing.T) {
 	defer stop()
 
 	// Воркер умер на последней попытке: attempts = max_attempts = 3, lease истёк.
-	id := insertStuck(t, "t16", 3, 0, "now() - interval '1 minute'")
-	execSQL(t, `UPDATE background.jobs SET payload = $1 WHERE id = $2`, idPayload(16), id)
+	id := insertStuck(t, "t16", 3, 0, "now() - interval '1 minute'", idPayload(16))
 
 	waitInteg(t, 10*time.Second, "completed despite attempts = max", func() bool {
 		return fetchJob(t, id).status == statusCompleted
@@ -819,7 +979,11 @@ func TestT17_ReclaimBudgetDeadLetter(t *testing.T) {
 	counter := newExecCounter()
 	stop := startEngines(t, 20*time.Millisecond, 2, 1, func(e *Engine) {
 		if err := e.RegisterHandler("t17", HandlerFunc(func(_ context.Context, p []byte) error {
-			counter.incr(payloadID(t, p))
+			id, err := payloadID(p)
+			if err != nil {
+				return err
+			}
+			counter.incr(id)
 			return nil
 		})); err != nil {
 			t.Fatal(err)
@@ -828,8 +992,7 @@ func TestT17_ReclaimBudgetDeadLetter(t *testing.T) {
 	defer stop()
 
 	// Бюджет исчерпан: reclaims = max_reclaims = 10 (дефолт колонки), lease истёк.
-	id := insertStuck(t, "t17", 2, 10, "now() - interval '1 minute'")
-	execSQL(t, `UPDATE background.jobs SET payload = $1 WHERE id = $2`, idPayload(17), id)
+	id := insertStuck(t, "t17", 2, 10, "now() - interval '1 minute'", idPayload(17))
 
 	waitInteg(t, 10*time.Second, "dead-lettered", func() bool {
 		return fetchJob(t, id).status == statusFailed

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeStore — in-memory подмена store для unit-тестов движка (design.md §9.1).
@@ -576,11 +577,19 @@ func TestEnqueueValidation(t *testing.T) {
 	if _, err := Enqueue(ctx, nil, strings.Repeat("x", 256), []byte("{}")); err == nil {
 		t.Error("task type longer than 255 chars: want error")
 	}
-	if _, err := Enqueue(ctx, nil, "t", []byte("{}"), WithMaxAttempts(0)); err == nil {
-		t.Error("WithMaxAttempts(0): want error")
+	// nil pool сознательно: валидация аргументов обязана срабатывать до
+	// nil-guard'а (и до похода в БД), поэтому тексты ошибок — от валидаторов.
+	_, err := Enqueue(ctx, nil, "t", []byte("{}"), WithMaxAttempts(0))
+	if err == nil || !strings.Contains(err.Error(), "WithMaxAttempts") {
+		t.Errorf("WithMaxAttempts(0): got %v, want WithMaxAttempts validation error", err)
 	}
-	if _, err := Enqueue(ctx, nil, "t", []byte("{}"), WithMaxReclaims(-1)); err == nil {
-		t.Error("WithMaxReclaims(-1): want error")
+	_, err = Enqueue(ctx, nil, "t", []byte("{}"), WithMaxReclaims(-1))
+	if err == nil || !strings.Contains(err.Error(), "WithMaxReclaims") {
+		t.Errorf("WithMaxReclaims(-1): got %v, want WithMaxReclaims validation error", err)
+	}
+	_, err = Enqueue(ctx, nil, "", []byte("{}"))
+	if err == nil || !strings.Contains(err.Error(), "task type") {
+		t.Errorf("empty task type: got %v, want task type validation error", err)
 	}
 }
 
@@ -618,11 +627,72 @@ func TestTruncate(t *testing.T) {
 	if got := truncate(long, 4096); len(got) != 4096 {
 		t.Errorf("truncate length = %d, want 4096", len(got))
 	}
-	// Многобайтовые руны не рвутся посимвольно.
-	multibyte := strings.Repeat("ю", 3000) // 2 байта на руну
+	// Трёхбайтовые руны: 4096 не делится на 3, срез попадает внутрь руны —
+	// цикл доводки границы обязан отработать.
+	multibyte := strings.Repeat("✓", 2000)
 	got := truncate(multibyte, 4096)
-	if len(got)%2 != 0 {
-		t.Errorf("truncate cut a multibyte rune: len=%d", len(got))
+	if !utf8.ValidString(got) {
+		t.Errorf("truncate produced invalid UTF-8: %q", got)
+	}
+	if want := 4095; len(got) != want { // 1365 полных рун
+		t.Errorf("truncate length = %d, want %d", len(got), want)
+	}
+	// Сырые невалидные байты sanitized даже без обрезки: PostgreSQL отклоняет
+	// невалидный UTF-8 в text (SQLSTATE 22021).
+	raw := "ok\xff" + string([]byte{0xfe}) + "bad"
+	got = truncate(raw, 4096)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncate passed invalid UTF-8 through: %q", got)
+	}
+	if !strings.HasPrefix(got, "ok") || !strings.HasSuffix(got, "bad") {
+		t.Errorf("truncate mangled valid parts: %q", got)
+	}
+}
+
+// TestRoutingToHandlers — каждый task_type получает свой payload (design.md §9.1
+// «маршрутизация payload в нужный обработчик»).
+func TestRoutingToHandlers(t *testing.T) {
+	e, fs := newTestEngine(t)
+	var mu sync.Mutex
+	got := map[string][]byte{}
+	mk := func(taskType string) JobHandler {
+		return HandlerFunc(func(_ context.Context, p []byte) error {
+			mu.Lock()
+			defer mu.Unlock()
+			got[taskType] = p
+			return nil
+		})
+	}
+	register(t, e, "type.a", mk("type.a"))
+	register(t, e, "type.b", mk("type.b"))
+
+	jobA, jobB := testJob(1, "type.a"), testJob(2, "type.b")
+	jobA.payload = []byte(`{"for":"a"}`)
+	jobB.payload = []byte(`{"for":"b"}`)
+	fs.queue = []*claimedJob{jobA, jobB}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Start(ctx, time.Millisecond, 2) }()
+
+	waitCond(t, 2*time.Second, "both jobs routed", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 2
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if string(got["type.a"]) != `{"for":"a"}` || string(got["type.b"]) != `{"for":"b"}` {
+		t.Errorf("routing mismatch: type.a=%q type.b=%q", got["type.a"], got["type.b"])
+	}
+	if c := fs.completed(); len(c) != 2 || c[0] != 1 || c[1] != 2 {
+		t.Errorf("Complete calls = %v, want [1 2] in claim order", c)
 	}
 }
 

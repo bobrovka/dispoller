@@ -89,12 +89,15 @@ type querier interface {
 
 // Enqueue вставляет задачу отдельной транзакцией пула.
 func Enqueue(ctx context.Context, pool *pgxpool.Pool, taskType string, payload []byte, opts ...EnqueueOption) (int64, error) {
-	if pool == nil {
-		return 0, errors.New("dispoller: pool must not be nil")
-	}
 	cfg, err := newEnqueueConfig(opts)
 	if err != nil {
 		return 0, err
+	}
+	if err := validateTaskType(taskType); err != nil {
+		return 0, err
+	}
+	if pool == nil {
+		return 0, errors.New("dispoller: pool must not be nil")
 	}
 	return enqueueRow(ctx, pool, taskType, payload, cfg.maxAttempts, cfg.maxReclaims, cfg.runAt)
 }
@@ -104,12 +107,15 @@ func Enqueue(ctx context.Context, pool *pgxpool.Pool, taskType string, payload [
 // задача не видна воркерам до коммита). Коммит/rollback — ответственность
 // вызывающего.
 func EnqueueTx(ctx context.Context, tx pgx.Tx, taskType string, payload []byte, opts ...EnqueueOption) (int64, error) {
-	if tx == nil {
-		return 0, errors.New("dispoller: tx must not be nil")
-	}
 	cfg, err := newEnqueueConfig(opts)
 	if err != nil {
 		return 0, err
+	}
+	if err := validateTaskType(taskType); err != nil {
+		return 0, err
+	}
+	if tx == nil {
+		return 0, errors.New("dispoller: tx must not be nil")
 	}
 	return enqueueRow(ctx, tx, taskType, payload, cfg.maxAttempts, cfg.maxReclaims, cfg.runAt)
 }
