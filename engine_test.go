@@ -3,6 +3,7 @@ package dispoller
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -574,12 +575,13 @@ func TestEnqueueValidation(t *testing.T) {
 	if _, err := Enqueue(ctx, nil, "", []byte("{}")); err == nil {
 		t.Error("empty task type: want error")
 	}
-	if _, err := Enqueue(ctx, nil, strings.Repeat("x", 256), []byte("{}")); err == nil {
-		t.Error("task type longer than 255 chars: want error")
+	_, err := Enqueue(ctx, nil, strings.Repeat("x", 256), []byte("{}"))
+	if err == nil || !strings.Contains(err.Error(), "255 characters") {
+		t.Errorf("task type longer than 255 chars: got %v, want length validation error", err)
 	}
 	// nil pool сознательно: валидация аргументов обязана срабатывать до
 	// nil-guard'а (и до похода в БД), поэтому тексты ошибок — от валидаторов.
-	_, err := Enqueue(ctx, nil, "t", []byte("{}"), WithMaxAttempts(0))
+	_, err = Enqueue(ctx, nil, "t", []byte("{}"), WithMaxAttempts(0))
 	if err == nil || !strings.Contains(err.Error(), "WithMaxAttempts") {
 		t.Errorf("WithMaxAttempts(0): got %v, want WithMaxAttempts validation error", err)
 	}
@@ -691,8 +693,9 @@ func TestRoutingToHandlers(t *testing.T) {
 	if string(got["type.a"]) != `{"for":"a"}` || string(got["type.b"]) != `{"for":"b"}` {
 		t.Errorf("routing mismatch: type.a=%q type.b=%q", got["type.a"], got["type.b"])
 	}
-	if c := fs.completed(); len(c) != 2 || c[0] != 1 || c[1] != 2 {
-		t.Errorf("Complete calls = %v, want [1 2] in claim order", c)
+	// Порядок завершений не детерминирован (два воркера) — сравниваем множество.
+	if c := fs.completed(); len(c) != 2 || !slices.Contains(c, int64(1)) || !slices.Contains(c, int64(2)) {
+		t.Errorf("Complete calls = %v, want both jobs {1, 2} in any order", c)
 	}
 }
 
