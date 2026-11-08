@@ -1010,7 +1010,7 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 | T-14 | `WithRunAt` | отложенная задача не захватывается до наступления времени, затем выполняется |
 | T-15 | NULL-дедлайн (SN-5) | `processing`-строка с `must_be_finished_at IS NULL` перехватывается и выполняется |
 | T-16 | перехват сверх лимита (SN-16) | зависшая задача с `attempts = max_attempts` и неполным бюджетом перехватывается и запускается повторно — единичный запуск сверх `max_attempts` задокументирован; `reclaims` растёт |
-| T-17 | бюджет перехватов (SN-18) | задача с `reclaims = max_reclaims` при перехвате уходит в `failed` без запуска обработчика (`error_message = 'reclaim budget exhausted'`, `lease_token = NULL`, `attempts` не тронут); `Requeue` возвращает её в pending с нулевыми счётчиками и задача выполняется; `Requeue` не-failed строки — 0 строк |
+| T-17 | бюджет перехватов (SN-18) | задача с `reclaims = max_reclaims` при перехвате уходит в `failed` без запуска обработчика (`error_message = 'reclaim budget exhausted'`, `lease_token = NULL`, `attempts` не тронут, итоговый `reclaims = max_reclaims + 1` — §5.1); `Requeue` возвращает её в pending с нулевыми счётчиками и задача выполняется; `Requeue` не-failed строки — 0 строк |
 
 ### 9.3. Ограничения среды
 
