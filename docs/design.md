@@ -482,7 +482,8 @@ RETURNING id;
 ## 6. Go API: интерфейсы и типы
 
 Пакет `dispoller` в корне модуля `github.com/bobrovka/dispoller`.
-Полный список файлов — §6.6.
+Полный список файлов — §6.7. Подпакет `runner` (§6.6) — опциональная обвязка
+для типового процесса-воркера; ядро его не импортирует.
 
 ### 6.1. Обработчик
 
@@ -696,7 +697,55 @@ func main() {
 }
 ```
 
-### 6.6. Структура репозитория
+### 6.6. Подпакет `runner`: обвязка процесса-воркера (опционально)
+
+Типовой процесс-воркер — это не только движок, но и эксплуатационная обвязка:
+периодический `Purge` (§10), служебный HTTP для healthcheck'ов и pprof,
+fail-fast на отсутствующей схеме, выверенный порядок запуска и остановки.
+Подпакет `github.com/bobrovka/dispoller/runner` собирает это в один объект.
+Слой строго аддитивный: runner построен только на публичном API ядра
+(`Engine`, `Enqueue`, `Purge`), ядро о runner не знает — проект вправе собрать
+свою обвязку руками (как example/email), результат идентичен. Отдельный
+подпакет (а не файлы в корне) удерживает границу механически: компилятор
+запрещает runner лезть в приватные детали ядра, а тому — зависеть от обвязки.
+
+```go
+func OpenPool(databaseURL string, concurrency int) (*pgxpool.Pool, error)
+// ParseConfig + MaxConns ≥ concurrency + 2 (§8) + Ping (10s); Close на вызывающем.
+
+func New(pool *pgxpool.Pool, opts ...Option) *Runner
+func (r *Runner) Run(ctx context.Context) error
+
+func WithLogger(l *slog.Logger) Option                    // дефолт slog.Default()
+func WithInterval(d time.Duration) Option                 // обязателен; валидирует Engine.Start
+func WithConcurrency(n int) Option                        // обязателен; валидирует Engine.Start
+func WithRegister(f func(*dispoller.Engine) error) Option // обязателен; RegisterHandler проекта
+func WithEngineOptions(opts ...dispoller.Option) Option   // WithBackoff и т.п.
+func WithPurge(interval, retention time.Duration, limit int64) Option // выкл по умолчанию
+func WithHTTPAddr(addr string) Option                     // выкл по умолчанию
+func WithSchemaCheck() Option                             // fail-fast: background.jobs есть
+```
+
+Инварианты `Run` (перенесены из продовой обвязки первого потребителя, каждая —
+регрессионно протестирована):
+
+- валидация конфигурации и ошибка колбека регистрации — синхронно, до запуска
+  горутин;
+- слушатель HTTP биндится синхронно (ошибка бинда — ошибка конфигурации,
+  видимая на старте), `WriteTimeout` не ставится: pprof-профили собираются
+  дольше секунды (`?seconds=30`);
+- HTTP (`/healthz` — чистый liveness без БД; `/readyz` — ping пула с бюджетом
+  2s; pprof) глушится **после** дрена in-flight задач движком — healthcheck
+  отвечает до конца остановки;
+- цикл очистки живёт на контексте, производном от ctx: синхронная ошибка
+  `Engine.Start` не оставляет его висеть в `Run`;
+- pprof слушает только указанный адрес — публиковать его наружу нельзя:
+  heap-дамп содержит содержимое памяти, включая секреты.
+
+Значения по умолчанию — §8; ничего из этого не влияет на ядро: runner не
+меняет ни схему, ни SQL, ни конкурентную модель.
+
+### 6.7. Структура репозитория
 
 ```
 .
@@ -707,6 +756,11 @@ func main() {
 ├── queries.go          // тексты SQL-запросов (константы)
 ├── engine_test.go      // unit-тесты (fake store)
 ├── integration_test.go // go:build integration; требует DISPOLLER_TEST_DSN
+├── runner/             // подпакет-обвязка (§6.6)
+│   ├── runner.go       // Runner, Option, OpenPool, Run, purgeLoop
+│   ├── http.go         // служебный mux: healthz/readyz/pprof
+│   ├── runner_test.go  // unit-тесты без БД (валидация, регрессии, HTTP)
+│   └── integration_test.go // go:build integration; RT-1…RT-4
 ├── schema/
 │   ├── schema.sql      // DDL из §4
 │   └── schema.go       // go:embed для тестов
@@ -961,6 +1015,8 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 | `max_attempts` | колонка / `WithMaxAttempts` | 3 | Запусков обработчика в штатном цикле (исключение — SN-16) |
 | `max_reclaims` | колонка / `WithMaxReclaims` | 10 | Бюджет перехватов ветки B (SN-18); щедрее реальной частоты жёстких остановок процесса (деплой без drain, eviction). Graceful shutdown бюджет не жжёт |
 | пул соединений | клиент (`pgxpool`) | pgx-дефолты | `MaxConns ≥ concurrency + 2` (dispatcher + финализации); соединение не удерживается на время Execute |
+| purge | `runner.WithPurge` (§6.6) | выкл | Очистка `completed` (§5.6): например суточная, retention 168h, `LIMIT 10000`; `failed` не трогаются |
+| служебный HTTP | `runner.WithHTTPAddr` (§6.6) | выкл | `/healthz`, `/readyz`, pprof; только localhost/закрытый контур |
 
 ---
 
@@ -985,6 +1041,12 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 - финализация выполняется после отмены ctx движка (`context.WithoutCancel`);
 - shutdown: `Start` возвращает nil, воркеры завершаются, канал закрывается;
 - конкурентность под `-race`: N воркеров × fake store с мьютексом.
+
+Подпакет `runner` (`runner/runner_test.go`, без БД): валидация `Run` (nil pool,
+нет `WithRegister`, параметры purge), регрессия «синхронная ошибка
+`Engine.Start` не подвешивает `Run` при запущенном purge-цикле», ошибка бинда
+на занятом адресе, обработчики HTTP с фейковым ping (healthz 200, readyz
+200/503, 404, pprof index).
 
 ### 9.2. Интеграционные тесты (`integration_test.go`)
 
@@ -1012,6 +1074,15 @@ delay(attempts) = min(base * 2^(attempts-1) * jitter(0.8..1.2), max)
 | T-16 | перехват сверх лимита (SN-16) | зависшая задача с `attempts = max_attempts` и неполным бюджетом перехватывается и запускается повторно — единичный запуск сверх `max_attempts` задокументирован; `reclaims` растёт |
 | T-17 | бюджет перехватов (SN-18) | задача с `reclaims = max_reclaims` при перехвате уходит в `failed` без запуска обработчика (`error_message = 'reclaim budget exhausted'`, `lease_token = NULL`, `attempts` не тронут, итоговый `reclaims = max_reclaims + 1` — §5.1); `Requeue` возвращает её в pending с нулевыми счётчиками и задача выполняется; `Requeue` не-failed строки — 0 строк |
 
+Подпакет `runner` (`runner/integration_test.go`, тот же DSN и тег):
+
+| # | Сценарий | Проверка |
+|---|---|---|
+| RT-1 | конвейер | `WithSchemaCheck` + регистрация колбеком: задача completed, отмена ctx → `Run` nil |
+| RT-2 | purge-цикл | `WithPurge`: completed-задача удаляется по тику |
+| RT-3 | schema check | БД без схемы очереди → понятная ошибка на старте |
+| RT-4 | служебный HTTP | healthz/readyz отвечают вместе с движком, глушатся при остановке |
+
 ### 9.3. Ограничения среды
 
 Тесты интеграционные гоняются с ограничением параллелизма: `go test -p 1` и без
@@ -1031,7 +1102,9 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
   частичным индексам. 10 инстансов × interval 1s ≈ 10 QPS — несущественно для PG.
 - **Рост таблицы.** `completed`/`failed` строки копятся: нужен периодический `Purge`
   (§5.6) — например, суточная задача с `LIMIT 10000`. `failed` стоит хранить дольше
-  (диагностика). Планировать autovacuum: очередь — churn-нагрузка (R-6).
+  (диагностика). Готовый цикл очистки — `runner.WithPurge` (§6.6); своя обвязка
+  вызывает `Purge` по своему расписанию. Планировать autovacuum: очередь —
+  churn-нагрузка (R-6).
 - **Мониторинг** (запросы для дашборда клиента):
   - глубина очереди: `SELECT count(*) FROM background.jobs WHERE status='pending' AND next_attempt_at <= now();`
   - застрявшие: `... WHERE status='processing' AND (must_be_finished_at < now() OR must_be_finished_at IS NULL);`
@@ -1045,8 +1118,8 @@ DISPOLLER_TEST_DSN=... go test -race -tags integration -p 1 ./...
   передавать ссылки (ID документов), а не содержимое (R-11).
 - **Совместимость схемы.** Клиент владеет миграциями; при рассинхронизации версии схемы
   и библиотеки (например, нет колонки `lease_token`) первый же claim упадёт с понятной
-  ошибкой — логируем и повторяем. Проверка схемы при старте (`SELECT` метаданных) —
-  опционально в v2.
+  ошибкой — логируем и повторяем. Fail-fast проверка существования таблицы на старте —
+  `runner.WithSchemaCheck` (§6.6).
 
 ---
 
