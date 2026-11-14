@@ -16,6 +16,33 @@ a job enqueued in the same transaction as business data, then processed by the
 engine). The schema (`schema/schema.sql`) is applied by the client's own
 migrator — the library is not a migration tool.
 
+## Runner (optional)
+
+Typical worker-process plumbing on top of the engine — a periodic purge loop
+for completed jobs, an ops HTTP server (`/healthz`, `/readyz`, pprof), a
+fail-fast schema check and a carefully ordered startup/shutdown — lives in the
+additive subpackage [`runner`](runner). The core stays independent: building
+your own loop directly on `Engine`/`Purge` remains an equivalent path.
+
+```go
+pool, err := runner.OpenPool(databaseURL, 2) // MaxConns ≥ concurrency + 2
+if err != nil { ... }
+defer pool.Close()
+
+r := runner.New(pool,
+    runner.WithInterval(time.Second),
+    runner.WithConcurrency(2),
+    runner.WithRegister(func(e *dispoller.Engine) error {
+        return e.RegisterHandler("email.send", &SendEmailHandler{},
+            dispoller.WithExecutionTimeout(30*time.Second))
+    }),
+    runner.WithPurge(24*time.Hour, 168*time.Hour, 10000), // optional
+    runner.WithHTTPAddr("localhost:8011"),                // optional; keep private
+    runner.WithSchemaCheck(),                              // optional fail-fast
+)
+err = r.Run(ctx) // blocks until ctx is cancelled, then drains in-flight jobs
+```
+
 ## Development
 
 ```sh
