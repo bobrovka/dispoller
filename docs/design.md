@@ -716,6 +716,9 @@ func OpenPool(databaseURL string, concurrency int) (*pgxpool.Pool, error)
 func New(pool *pgxpool.Pool, opts ...Option) *Runner
 func (r *Runner) Run(ctx context.Context) error
 
+func CheckQueueSchema(ctx context.Context, pool *pgxpool.Pool) error
+// fail-fast: background.jobs существует; публичный хелпер для CLI вне Run.
+
 func WithLogger(l *slog.Logger) Option                    // дефолт slog.Default()
 func WithInterval(d time.Duration) Option                 // обязателен; валидирует Engine.Start
 func WithConcurrency(n int) Option                        // обязателен; валидирует Engine.Start
@@ -723,11 +726,12 @@ func WithRegister(f func(*dispoller.Engine) error) Option // обязателе�
 func WithEngineOptions(opts ...dispoller.Option) Option   // WithBackoff и т.п.
 func WithPurge(interval, retention time.Duration, limit int64) Option // выкл по умолчанию
 func WithHTTPAddr(addr string) Option                     // выкл по умолчанию
-func WithSchemaCheck() Option                             // fail-fast: background.jobs есть
+func WithSchemaCheck() Option                             // fail-fast: background.jobs есть (CheckQueueSchema)
 ```
 
-Инварианты `Run` (перенесены из продовой обвязки первого потребителя, каждая —
-регрессионно протестирована):
+Инварианты `Run` (перенесены из продовой обвязки первого потребителя вместе с
+регрессионными тестами; строгий порядок «HTTP гасится после дрена» покрыт
+частично — сам факт глушения при остановке, RT-4):
 
 - валидация конфигурации и ошибка колбека регистрации — синхронно, до запуска
   горутин;

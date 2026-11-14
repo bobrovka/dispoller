@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,22 +123,27 @@ func waitInteg(t *testing.T, timeout time.Duration, desc string, cond func() boo
 }
 
 // startRunner запускает Run в горутине; остановка — отмена контекста с
-// проверкой, что Run вернулся (graceful shutdown).
+// проверкой, что Run вернулся (graceful shutdown). Возвращаемый stop
+// идемпотентен (sync.Once): тест может вызвать его явно и продолжить проверки
+// после остановки — Cleanup повторного ожидания не устроит.
 func startRunner(t *testing.T, r *Runner) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
+	var once sync.Once
 	stop := func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("run: %v", err)
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("run: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("Run не вернулся за 10s после отмены контекста")
 			}
-		case <-time.After(10 * time.Second):
-			t.Error("Run не вернулся за 10s после отмены контекста")
-		}
+		})
 	}
 	t.Cleanup(stop)
 	return stop
@@ -195,19 +202,30 @@ func TestRT1_RunnerPipeline(t *testing.T) {
 
 // RT-2: WithPurge — completed-задача удаляется по тику очистки
 // (retention 0 — удалять сразу; сам Purge — функциональность ядра, здесь
-// проверяется только цикл runner).
+// проверяется только цикл runner). Выполнение фиксируется счётчиком, а не
+// статусом в БД: purge с retention 0 может удалить completed-строку между
+// опросами — ждать «completed» по базе это гонка со cleanup'ом теста.
 func TestRT2_RunnerPurgesCompleted(t *testing.T) {
+	var executed atomic.Int64
 	r := New(testPool,
 		WithInterval(20*time.Millisecond),
 		WithConcurrency(1),
-		WithRegister(registerNoop("rt2")),
+		WithRegister(func(e *dispoller.Engine) error {
+			return e.RegisterHandler("rt2", dispoller.HandlerFunc(func(context.Context, []byte) error {
+				executed.Add(1)
+				return nil
+			}))
+		}),
 		WithPurge(100*time.Millisecond, 0, 100),
 	)
 	startRunner(t, r)
 
 	id := mustEnqueue(t, "rt2")
-	waitInteg(t, 10*time.Second, "completed", func() bool { return jobStatus(t, id) == "completed" })
+	waitInteg(t, 10*time.Second, "executed", func() bool { return executed.Load() == 1 })
 	waitInteg(t, 15*time.Second, "purged", func() bool { return jobStatus(t, id) == "" })
+	if n := executed.Load(); n != 1 {
+		t.Errorf("обработчик запущен %d раз, хотим 1", n)
+	}
 }
 
 // RT-3: WithSchemaCheck на БД без схемы очереди — понятная ошибка на старте.
@@ -234,7 +252,7 @@ func TestRT3_RunnerSchemaCheckMissingTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bare.Close()
+	defer bare.Close() // Close не возвращает значение — errcheck не касается
 
 	r := New(bare,
 		WithInterval(time.Second), WithConcurrency(1), WithRegister(registerNoop("rt3")),
@@ -253,7 +271,9 @@ func TestRT3_RunnerSchemaCheckMissingTable(t *testing.T) {
 }
 
 // RT-4: WithHTTPAddr — служебный HTTP поднимается вместе с движком и отвечает
-// (healthz — liveness, readyz — ping живой БД), при отмене ctx глушится.
+// (healthz — liveness, readyz — ping живой БД); после остановки (Run вернулся,
+// in-flight задачи дренированы) слушатель закрыт — соединения отбиваются.
+// Регрессия «Shutdown забыт» ловится последней проверкой.
 func TestRT4_RunnerServesHTTP(t *testing.T) {
 	// Свободный порт: занять :0, запомнить адрес, освободить. Окно гонки
 	// между Close и Listen ничтожно.
@@ -262,13 +282,13 @@ func TestRT4_RunnerServesHTTP(t *testing.T) {
 		t.Fatalf("listen :0: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	r := New(testPool,
 		WithInterval(20*time.Millisecond), WithConcurrency(1), WithRegister(registerNoop("rt4")),
 		WithHTTPAddr(addr),
 	)
-	startRunner(t, r)
+	stop := startRunner(t, r)
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	for _, path := range []string{"/healthz", "/readyz"} {
@@ -277,8 +297,16 @@ func TestRT4_RunnerServesHTTP(t *testing.T) {
 			if err != nil {
 				return false
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			return resp.StatusCode == http.StatusOK
 		})
 	}
+
+	// Слушатель закрывается вместе с остановкой: healthcheck не должен
+	// отвечать «ok» от уже остановленного воркера.
+	stop()
+	waitInteg(t, 5*time.Second, "listener closed after stop", func() bool {
+		_, err := client.Get("http://" + addr + "/healthz")
+		return err != nil
+	})
 }

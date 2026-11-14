@@ -128,7 +128,7 @@ func TestRunListenError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen :0: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }() // порт занят до конца теста
 
 	r := New(lazyPool(t),
 		WithInterval(time.Second), WithConcurrency(1), WithRegister(noopRegister),
@@ -174,7 +174,7 @@ func httpGet(t *testing.T, url string) (int, string) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
 		t.Fatalf("read body: %v", err)

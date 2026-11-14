@@ -173,7 +173,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	if r.schemaCheck {
-		if err := r.checkQueueSchema(); err != nil {
+		// ctx отвязан от отмены: проверка — часть старта, и отменённый к моменту
+		// вызова ctx процесса не должен превращать её в ложную ошибку про схему.
+		if err := CheckQueueSchema(context.WithoutCancel(ctx), r.pool); err != nil {
 			return err
 		}
 	}
@@ -228,14 +230,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	return err
 }
 
-// checkQueueSchema проверяет существование background.jobs (бюджет 10s, не
-// зависящий от ctx: проверка — часть старта, а не работы). Без таблицы очереди
-// воркер не работает; миграции — ответственность проекта.
-func (r *Runner) checkQueueSchema() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// CheckQueueSchema проверяет существование таблицы background.jobs (бюджет
+// 10s). Без таблицы очереди воркер и постановка задач не работают; миграции —
+// ответственность проекта. Публичный хелпер — для fail-fast вне Run (например,
+// CLI постановки задач до старта воркера); Run с WithSchemaCheck зовёт его сам.
+func CheckQueueSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return errors.New("runner: pool must not be nil")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	var exists bool
-	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (
+	if err := pool.QueryRow(checkCtx, `SELECT EXISTS (
 		SELECT 1 FROM information_schema.tables
 		WHERE table_schema = 'background' AND table_name = 'jobs')`).Scan(&exists); err != nil {
 		return fmt.Errorf("runner: check background.jobs: %w", err)
